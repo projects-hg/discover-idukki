@@ -68,22 +68,6 @@
     return map[type] || '#666';
   }
 
-  // ---- Initialization ----
-  function init() {
-    cacheDom();
-    renderCategoryCards();
-    renderFilterChips();
-    renderSeasonOptions();
-    applyFiltersAndSort();
-    renderStays();
-    renderTransport();
-    setupEventListeners();
-    setupScrollAnimations();
-    setupParallax();
-    setupNavScroll();
-    updateSegmentedIndicator();
-  }
-
   // ---- Render: Category Quick Links ----
   function renderCategoryCards() {
     dom.categoryCards.innerHTML = CATEGORIES.map((cat, i) => {
@@ -644,7 +628,274 @@
     });
   }
 
+  // ---- Interactive Map ----
+  let map, mapMarkers = [], mapPolylines = [], distanceLabels = [];
+  const mapSelectedPlaces = [];
+
+  function initMap() {
+    dom.mapPlaceList = document.getElementById('mapPlaceList');
+    dom.mapClearSelection = document.getElementById('mapClearSelection');
+    dom.distanceList = document.getElementById('distanceList');
+    dom.distanceTotal = document.getElementById('distanceTotal');
+    dom.mapDistancePanel = document.getElementById('mapDistancePanel');
+
+    // Center on Idukki district
+    map = L.map('leafletMap', {
+      scrollWheelZoom: false,
+      zoomControl: true
+    }).setView([10.0, 77.05], 10);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      maxZoom: 18
+    }).addTo(map);
+
+    renderMapPlaceList();
+    addAllMarkers();
+    setupMapEvents();
+
+    // Fix tile rendering when map is inside a hidden/reveal element
+    setTimeout(function () { map.invalidateSize(); }, 500);
+
+    // Also invalidate on scroll reveal
+    const mapObserver = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          map.invalidateSize();
+          mapObserver.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.1 });
+    mapObserver.observe(document.getElementById('leafletMap'));
+  }
+
+  function renderMapPlaceList() {
+    dom.mapPlaceList.innerHTML = TOURIST_PLACES.map(function (place) {
+      const cat = getCategoryMeta(place.category);
+      return '<div class="map-place-item" data-id="' + place.id + '">' +
+        '<span class="map-item-number">' + place.id + '</span>' +
+        '<div class="map-item-info">' +
+          '<div class="map-item-name">' + place.name + '</div>' +
+          '<div class="map-item-cat">' + cat.icon + ' ' + cat.label + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function addAllMarkers() {
+    TOURIST_PLACES.forEach(function (place) {
+      var icon = L.divIcon({
+        className: 'custom-marker',
+        html: '<span>' + place.id + '</span>',
+        iconSize: [32, 32],
+        iconAnchor: [16, 16]
+      });
+
+      var marker = L.marker([place.coordinates.lat, place.coordinates.lng], { icon: icon })
+        .addTo(map)
+        .bindPopup('<strong>' + place.name + '</strong><br>' + place.location);
+
+      marker.placeId = place.id;
+      marker.on('click', function () {
+        toggleMapSelection(place.id);
+      });
+
+      mapMarkers.push(marker);
+    });
+  }
+
+  function toggleMapSelection(placeId) {
+    var idx = mapSelectedPlaces.indexOf(placeId);
+    if (idx > -1) {
+      mapSelectedPlaces.splice(idx, 1);
+    } else {
+      mapSelectedPlaces.push(placeId);
+    }
+    updateMapUI();
+  }
+
+  function clearMapSelection() {
+    mapSelectedPlaces.length = 0;
+    updateMapUI();
+  }
+
+  function updateMapUI() {
+    // Update sidebar list
+    dom.mapPlaceList.querySelectorAll('.map-place-item').forEach(function (item) {
+      var id = parseInt(item.dataset.id, 10);
+      var isSelected = mapSelectedPlaces.indexOf(id) > -1;
+      item.classList.toggle('selected', isSelected);
+
+      // Update the number to show selection order
+      var numEl = item.querySelector('.map-item-number');
+      if (isSelected) {
+        numEl.textContent = mapSelectedPlaces.indexOf(id) + 1;
+      } else {
+        numEl.textContent = id;
+      }
+    });
+
+    // Update markers
+    mapMarkers.forEach(function (marker) {
+      var isSelected = mapSelectedPlaces.indexOf(marker.placeId) > -1;
+      var hasSelection = mapSelectedPlaces.length > 0;
+      var el = marker.getElement();
+      if (!el) return;
+      var inner = el.querySelector('.custom-marker') || el;
+
+      if (isSelected) {
+        inner.className = 'custom-marker marker-selected';
+        var orderNum = mapSelectedPlaces.indexOf(marker.placeId) + 1;
+        inner.querySelector('span').textContent = orderNum;
+      } else if (hasSelection) {
+        inner.className = 'custom-marker marker-unselected';
+        inner.querySelector('span').textContent = marker.placeId;
+      } else {
+        inner.className = 'custom-marker';
+        inner.querySelector('span').textContent = marker.placeId;
+      }
+    });
+
+    // Draw polylines between selected places
+    clearPolylines();
+    if (mapSelectedPlaces.length >= 2) {
+      drawRouteLines();
+      renderDistances();
+      fitMapToSelection();
+    } else {
+      dom.distanceList.innerHTML = '<p class="distance-empty">Select 2 or more places to see distances</p>';
+      dom.distanceTotal.classList.remove('visible');
+    }
+  }
+
+  function clearPolylines() {
+    mapPolylines.forEach(function (pl) { map.removeLayer(pl); });
+    mapPolylines = [];
+    distanceLabels.forEach(function (lb) { map.removeLayer(lb); });
+    distanceLabels = [];
+  }
+
+  function drawRouteLines() {
+    for (var i = 0; i < mapSelectedPlaces.length - 1; i++) {
+      var placeA = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i]; });
+      var placeB = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i + 1]; });
+      if (!placeA || !placeB) continue;
+
+      var latLngs = [
+        [placeA.coordinates.lat, placeA.coordinates.lng],
+        [placeB.coordinates.lat, placeB.coordinates.lng]
+      ];
+
+      var polyline = L.polyline(latLngs, {
+        color: '#2d5016',
+        weight: 3,
+        opacity: 0.8,
+        dashArray: '8, 8'
+      }).addTo(map);
+      mapPolylines.push(polyline);
+
+      // Distance label at midpoint
+      var dist = haversineDistance(
+        placeA.coordinates.lat, placeA.coordinates.lng,
+        placeB.coordinates.lat, placeB.coordinates.lng
+      );
+      var midLat = (placeA.coordinates.lat + placeB.coordinates.lat) / 2;
+      var midLng = (placeA.coordinates.lng + placeB.coordinates.lng) / 2;
+
+      var label = L.marker([midLat, midLng], {
+        icon: L.divIcon({
+          className: 'distance-label',
+          html: dist.toFixed(1) + ' km',
+          iconSize: [60, 20],
+          iconAnchor: [30, 10]
+        }),
+        interactive: false
+      }).addTo(map);
+      distanceLabels.push(label);
+    }
+  }
+
+  function renderDistances() {
+    var rows = '';
+    var totalDist = 0;
+
+    for (var i = 0; i < mapSelectedPlaces.length - 1; i++) {
+      var placeA = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i]; });
+      var placeB = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i + 1]; });
+      if (!placeA || !placeB) continue;
+
+      var dist = haversineDistance(
+        placeA.coordinates.lat, placeA.coordinates.lng,
+        placeB.coordinates.lat, placeB.coordinates.lng
+      );
+      totalDist += dist;
+
+      rows += '<div class="distance-row">' +
+        '<span class="dist-from">' + (i + 1) + '. ' + placeA.name + '</span>' +
+        '<span class="dist-arrow">→</span>' +
+        '<span class="dist-to">' + (i + 2) + '. ' + placeB.name + '</span>' +
+        '<span class="dist-value">' + dist.toFixed(1) + ' km</span>' +
+      '</div>';
+    }
+
+    dom.distanceList.innerHTML = rows;
+
+    if (mapSelectedPlaces.length > 2) {
+      dom.distanceTotal.textContent = 'Total distance: ' + totalDist.toFixed(1) + ' km (straight line)';
+      dom.distanceTotal.classList.add('visible');
+    } else {
+      dom.distanceTotal.classList.remove('visible');
+    }
+  }
+
+  function fitMapToSelection() {
+    var coords = mapSelectedPlaces.map(function (id) {
+      var p = TOURIST_PLACES.find(function (pl) { return pl.id === id; });
+      return [p.coordinates.lat, p.coordinates.lng];
+    });
+    var bounds = L.latLngBounds(coords);
+    map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
+  }
+
+  function haversineDistance(lat1, lon1, lat2, lon2) {
+    var R = 6371; // km
+    var dLat = (lat2 - lat1) * Math.PI / 180;
+    var dLon = (lon2 - lon1) * Math.PI / 180;
+    var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  function setupMapEvents() {
+    dom.mapPlaceList.addEventListener('click', function (e) {
+      var item = e.target.closest('.map-place-item');
+      if (!item) return;
+      var id = parseInt(item.dataset.id, 10);
+      toggleMapSelection(id);
+    });
+
+    dom.mapClearSelection.addEventListener('click', clearMapSelection);
+  }
+
   // ---- Bootstrap ----
+  function init() {
+    cacheDom();
+    renderCategoryCards();
+    renderFilterChips();
+    renderSeasonOptions();
+    applyFiltersAndSort();
+    renderStays();
+    renderTransport();
+    setupEventListeners();
+    setupScrollAnimations();
+    setupParallax();
+    setupNavScroll();
+    updateSegmentedIndicator();
+    initMap();
+  }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
