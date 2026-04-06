@@ -756,12 +756,12 @@
       }
     });
 
-    // Draw polylines between selected places
+    // Draw routes between selected places
     clearPolylines();
     if (mapSelectedPlaces.length >= 2) {
-      drawRouteLines();
-      renderDistances();
-      fitMapToSelection();
+      dom.distanceList.innerHTML = '<p class="distance-empty">Loading road routes...</p>';
+      dom.distanceTotal.classList.remove('visible');
+      fetchAllRoutes();
     } else {
       dom.distanceList.innerHTML = '<p class="distance-empty">Select 2 or more places to see distances</p>';
       dom.distanceTotal.classList.remove('visible');
@@ -775,90 +775,197 @@
     distanceLabels = [];
   }
 
-  function drawRouteLines() {
-    for (var i = 0; i < mapSelectedPlaces.length - 1; i++) {
-      var placeA = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i]; });
-      var placeB = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i + 1]; });
-      if (!placeA || !placeB) continue;
+  // Track which request batch is current so stale responses are ignored
+  var routeRequestId = 0;
 
-      var latLngs = [
+  function fetchAllRoutes() {
+    var currentRequestId = ++routeRequestId;
+    var segments = [];
+
+    for (var i = 0; i < mapSelectedPlaces.length - 1; i++) {
+      segments.push({
+        placeA: TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i]; }),
+        placeB: TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i + 1]; }),
+        index: i
+      });
+    }
+
+    var results = new Array(segments.length);
+    var completed = 0;
+
+    segments.forEach(function (seg, idx) {
+      fetchOSRMRoute(seg.placeA, seg.placeB, function (data) {
+        // Ignore if a newer selection happened while we were fetching
+        if (currentRequestId !== routeRequestId) return;
+
+        results[idx] = data;
+        completed++;
+
+        // Draw this segment immediately
+        drawRoutSegment(data, seg.placeA, seg.placeB);
+
+        // When all segments are done, render the distance panel and fit bounds
+        if (completed === segments.length) {
+          renderDistances(results, segments);
+          fitMapToRoutes();
+        }
+      });
+    });
+  }
+
+  function fetchOSRMRoute(placeA, placeB, callback) {
+    var url = 'https://router.project-osrm.org/route/v1/driving/' +
+      placeA.coordinates.lng + ',' + placeA.coordinates.lat + ';' +
+      placeB.coordinates.lng + ',' + placeB.coordinates.lat +
+      '?overview=full&geometries=geojson';
+
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
+          var route = data.routes[0];
+          callback({
+            distance: route.distance / 1000, // metres to km
+            duration: route.duration,          // seconds
+            geometry: route.geometry            // GeoJSON LineString
+          });
+        } else {
+          // Fallback to straight line if OSRM can't route
+          callback({
+            distance: haversineDistance(
+              placeA.coordinates.lat, placeA.coordinates.lng,
+              placeB.coordinates.lat, placeB.coordinates.lng
+            ),
+            duration: null,
+            geometry: null,
+            fallback: true
+          });
+        }
+      })
+      .catch(function () {
+        callback({
+          distance: haversineDistance(
+            placeA.coordinates.lat, placeA.coordinates.lng,
+            placeB.coordinates.lat, placeB.coordinates.lng
+          ),
+          duration: null,
+          geometry: null,
+          fallback: true
+        });
+      });
+  }
+
+  function drawRoutSegment(routeData, placeA, placeB) {
+    var latLngs;
+
+    if (routeData.geometry) {
+      // OSRM returns GeoJSON [lng, lat], Leaflet needs [lat, lng]
+      latLngs = routeData.geometry.coordinates.map(function (coord) {
+        return [coord[1], coord[0]];
+      });
+    } else {
+      // Straight line fallback
+      latLngs = [
         [placeA.coordinates.lat, placeA.coordinates.lng],
         [placeB.coordinates.lat, placeB.coordinates.lng]
       ];
-
-      var polyline = L.polyline(latLngs, {
-        color: '#2d5016',
-        weight: 3,
-        opacity: 0.8,
-        dashArray: '8, 8'
-      }).addTo(map);
-      mapPolylines.push(polyline);
-
-      // Distance label at midpoint
-      var dist = haversineDistance(
-        placeA.coordinates.lat, placeA.coordinates.lng,
-        placeB.coordinates.lat, placeB.coordinates.lng
-      );
-      var midLat = (placeA.coordinates.lat + placeB.coordinates.lat) / 2;
-      var midLng = (placeA.coordinates.lng + placeB.coordinates.lng) / 2;
-
-      var label = L.marker([midLat, midLng], {
-        icon: L.divIcon({
-          className: 'distance-label',
-          html: dist.toFixed(1) + ' km',
-          iconSize: [60, 20],
-          iconAnchor: [30, 10]
-        }),
-        interactive: false
-      }).addTo(map);
-      distanceLabels.push(label);
     }
+
+    var polyline = L.polyline(latLngs, {
+      color: routeData.fallback ? '#999' : '#2d5016',
+      weight: routeData.fallback ? 2 : 4,
+      opacity: 0.85,
+      dashArray: routeData.fallback ? '6, 6' : null,
+      lineJoin: 'round'
+    }).addTo(map);
+    mapPolylines.push(polyline);
+
+    // Distance label at the midpoint of the route
+    var midIdx = Math.floor(latLngs.length / 2);
+    var midPoint = latLngs[midIdx];
+
+    var labelText = routeData.distance.toFixed(1) + ' km';
+    if (routeData.duration) {
+      labelText += ' · ' + formatDuration(routeData.duration);
+    }
+
+    var label = L.marker(midPoint, {
+      icon: L.divIcon({
+        className: 'distance-label' + (routeData.fallback ? ' distance-label-fallback' : ''),
+        html: labelText,
+        iconSize: null,
+        iconAnchor: [40, 10]
+      }),
+      interactive: false,
+      zIndexOffset: -100
+    }).addTo(map);
+    distanceLabels.push(label);
   }
 
-  function renderDistances() {
+  function renderDistances(results, segments) {
     var rows = '';
     var totalDist = 0;
+    var totalDuration = 0;
+    var allHaveDuration = true;
 
-    for (var i = 0; i < mapSelectedPlaces.length - 1; i++) {
-      var placeA = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i]; });
-      var placeB = TOURIST_PLACES.find(function (p) { return p.id === mapSelectedPlaces[i + 1]; });
-      if (!placeA || !placeB) continue;
+    for (var i = 0; i < results.length; i++) {
+      var r = results[i];
+      var seg = segments[i];
+      totalDist += r.distance;
+      if (r.duration) {
+        totalDuration += r.duration;
+      } else {
+        allHaveDuration = false;
+      }
 
-      var dist = haversineDistance(
-        placeA.coordinates.lat, placeA.coordinates.lng,
-        placeB.coordinates.lat, placeB.coordinates.lng
-      );
-      totalDist += dist;
+      var distText = r.distance.toFixed(1) + ' km';
+      if (r.duration) {
+        distText += '<span class="dist-time"> · ' + formatDuration(r.duration) + '</span>';
+      }
+      if (r.fallback) {
+        distText += '<span class="dist-approx"> (approx)</span>';
+      }
 
       rows += '<div class="distance-row">' +
-        '<span class="dist-from">' + (i + 1) + '. ' + placeA.name + '</span>' +
+        '<span class="dist-from">' + (i + 1) + '. ' + seg.placeA.name + '</span>' +
         '<span class="dist-arrow">→</span>' +
-        '<span class="dist-to">' + (i + 2) + '. ' + placeB.name + '</span>' +
-        '<span class="dist-value">' + dist.toFixed(1) + ' km</span>' +
+        '<span class="dist-to">' + (i + 2) + '. ' + seg.placeB.name + '</span>' +
+        '<span class="dist-value">' + distText + '</span>' +
       '</div>';
     }
 
     dom.distanceList.innerHTML = rows;
 
     if (mapSelectedPlaces.length > 2) {
-      dom.distanceTotal.textContent = 'Total distance: ' + totalDist.toFixed(1) + ' km (straight line)';
+      var totalText = 'Total: ' + totalDist.toFixed(1) + ' km';
+      if (allHaveDuration) {
+        totalText += ' · ' + formatDuration(totalDuration);
+      }
+      dom.distanceTotal.textContent = totalText;
       dom.distanceTotal.classList.add('visible');
     } else {
       dom.distanceTotal.classList.remove('visible');
     }
   }
 
-  function fitMapToSelection() {
-    var coords = mapSelectedPlaces.map(function (id) {
-      var p = TOURIST_PLACES.find(function (pl) { return pl.id === id; });
-      return [p.coordinates.lat, p.coordinates.lng];
-    });
-    var bounds = L.latLngBounds(coords);
-    map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
+  function fitMapToRoutes() {
+    // Fit to all polyline bounds combined
+    if (mapPolylines.length === 0) return;
+    var group = L.featureGroup(mapPolylines);
+    map.fitBounds(group.getBounds(), { padding: [50, 50], maxZoom: 13 });
+  }
+
+  function formatDuration(seconds) {
+    var hrs = Math.floor(seconds / 3600);
+    var mins = Math.round((seconds % 3600) / 60);
+    if (hrs > 0) {
+      return hrs + 'h ' + mins + 'm';
+    }
+    return mins + ' min';
   }
 
   function haversineDistance(lat1, lon1, lat2, lon2) {
-    var R = 6371; // km
+    var R = 6371;
     var dLat = (lat2 - lat1) * Math.PI / 180;
     var dLon = (lon2 - lon1) * Math.PI / 180;
     var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
